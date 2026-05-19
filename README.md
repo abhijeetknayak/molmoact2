@@ -31,7 +31,7 @@
     <img alt="ER Datasets" src="https://img.shields.io/badge/HF-ER%20Datasets-yellow?logo=huggingface">
   </a>
   <a href="https://molmospaces.allen.ai/leaderboard">
-    <img alt="1st VLA on MolmoSpace" src="https://img.shields.io/badge/MolmoSpace-Top%20VLA-success?logo=trophy&logoColor=white">
+    <img alt="1st VLA on MolmoSpace" src="https://img.shields.io/badge/MolmoSpace-1st%20VLA-success?logo=trophy&logoColor=gold">
   </a>
 </p>
 
