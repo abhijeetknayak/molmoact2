@@ -122,6 +122,8 @@ All required components can be purchased using this [Bimanual YAM parts list](ht
 
 Implementation code for setting up, data collection, and inference for Bimanual YAM is [here](https://github.com/williamtsai726/YAM)
 
+Standardize evaluation implementation for zero-shot by Cortex AI [here](https://gist.github.com/SuveenE/6bc2b822ac44807565729c2b0ebb1cb2)
+
 ### Franka Setup
 
 For the Franka setup, we recommend following the official [DROID implementation](https://github.com/droid-dataset/droid) for best results.
