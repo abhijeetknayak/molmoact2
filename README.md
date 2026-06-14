@@ -219,9 +219,9 @@ sudo ufw allow from <subnet> to any port 8000 proto tcp   # DROID
 sudo ufw allow from <subnet> to any port 8202 proto tcp   # YAM
 ```
 
-## 6. Coming Soon
+## 6. Pre-training and Post-training
 
-Full code for training, fine-tuning, deployment, evaluation, and more details are coming soon.
+[Full code](https://github.com/allenai/molmoact2/tree/main/experiments)
 
 ## 7. License
 
