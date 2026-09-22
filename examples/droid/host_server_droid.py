@@ -217,6 +217,7 @@ class Policy:
         actions = np.asarray(raw, dtype=np.float32)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
+        print(f"MolmoAct2 predict: actions.shape={actions.shape}, actions={actions}")
         return actions
 
 
