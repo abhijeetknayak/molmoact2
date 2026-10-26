@@ -195,7 +195,7 @@ class Policy:
         ext_pil = _to_pil(external_cam)
         wri_pil = _to_pil(wrist_cam)
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
-        print(f"MolmoAct2 input state={state_f32}")
+        # print(f"MolmoAct2 input state={state_f32}")
         if state_f32.shape != (8,):
             raise ValueError(f"state must be shape (8,), got {state_f32.shape}")
 
@@ -218,7 +218,7 @@ class Policy:
         actions = np.asarray(raw, dtype=np.float32)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
-        print(f"MolmoAct2 predicted actions={actions}")
+        # print(f"MolmoAct2 predicted actions={actions}")
         return actions
 
 
