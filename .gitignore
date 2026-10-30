@@ -24,6 +24,7 @@ build/
 
 # Virtual environments (uv)
 .venv/
+.molmoact2/
 venv/
 env/
 
@@ -58,3 +59,5 @@ sim_eval/outputs/
 # Scratch / duplicates
 *.tmp
 * copy.*
+
+checkpoint/

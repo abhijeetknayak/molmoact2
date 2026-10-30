@@ -3295,7 +3295,8 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         action_dim_is_pad: Optional[torch.Tensor] = None,
         action_horizon: Optional[int] = None,
         num_steps: Optional[int] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: Optional[Union[torch.Generator, Sequence[torch.Generator]]] = None,
+        num_samples: int = 1,
         encoder_kv_states: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -3333,6 +3334,29 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
             depth_mask,
             depth_gate,
         )
+        if num_samples > 1:
+            # Expand the encoded context rather than re-running the vision/LM
+            # backbone for identical observations.
+            batch_size = encoder_kv_states[0][0].shape[0]
+            encoder_kv_states = [
+                (
+                    key.repeat_interleave(num_samples, dim=0),
+                    value.repeat_interleave(num_samples, dim=0),
+                )
+                for key, value in encoder_kv_states
+            ]
+            if encoder_attention_mask is not None:
+                encoder_attention_mask = encoder_attention_mask.repeat_interleave(
+                    num_samples, dim=0
+                )
+
+            if states is not None:
+                states = states.repeat_interleave(num_samples, dim=0)
+            if action_dim_is_pad is not None:
+                action_dim_is_pad = action_dim_is_pad.reshape(
+                    -1, self.config.max_action_dim
+                ).expand(batch_size, -1).repeat_interleave(num_samples, dim=0)
+
         steps = int(num_steps or self.config.flow_matching_num_steps)
         if steps <= 0:
             raise ValueError(f"num_steps must be >= 1, got {steps}.")
@@ -3341,12 +3365,25 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         device = source_tensor.device
         action_horizon = self._resolve_action_horizon(action_horizon)
         trajectory_dtype = action_expert.action_embed.weight.dtype
-        trajectory = torch.randn(
-            (batch_size, action_horizon, self.config.max_action_dim),
-            device=device,
-            dtype=trajectory_dtype,
-            generator=generator,
-        )
+        # A generator sequence assigns a separate RNG to each output row
+        # (observation-major, then sample-major).
+        if isinstance(generator, Sequence):
+            trajectory = torch.stack([
+                torch.randn(
+                    (action_horizon, self.config.max_action_dim),
+                    device=device,
+                    dtype=trajectory_dtype,
+                    generator=sample_generator,
+                )
+                for sample_generator in generator
+            ])
+        else:
+            trajectory = torch.randn(
+                (batch_size, action_horizon, self.config.max_action_dim),
+                device=device,
+                dtype=trajectory_dtype,
+                generator=generator,
+            )
         trajectory = self._mask_action_dim_tensor(
             trajectory,
             action_dim_is_pad=action_dim_is_pad,
@@ -4598,7 +4635,8 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
         action_tokenizer: Any = None,
         num_steps: Optional[int] = None,
         n_action_steps: Optional[int] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: Optional[Union[torch.Generator, Sequence[torch.Generator]]] = None,
+        num_samples: int = 1,
         normalize_language: bool = True,
         enable_cuda_graph: bool = True,
         return_dict: bool = True,
@@ -4730,6 +4768,7 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
                     action_horizon=generation_horizon,
                     num_steps=num_steps,
                     generator=generator,
+                    num_samples=num_samples,
                     encoder_kv_states=depth_prefix.encoder_kv_states,
                     encoder_attention_mask=self.model._get_encoder_attention_mask(
                         depth_prefix.full_input_ids,
@@ -4752,6 +4791,7 @@ class MolmoAct2ForConditionalGeneration(MolmoAct2PreTrainedModel, GenerationMixi
                     action_horizon=generation_horizon,
                     num_steps=num_steps,
                     generator=generator,
+                    num_samples=num_samples,
                 )
         else:
             if enable_depth_reasoning:

@@ -17,7 +17,7 @@ Wire protocol (matches `inference_script.py` client):
 
 Run:
 
-    uv run python host_server.py --host 0.0.0.0 --port 8000
+    uv run python examples/droid/host_server_droid.py --host 0.0.0.0 --port 8000
 
 Then point clients at http://<lan-ip>:8000 (e.g. http://172.16.0.42:8000).
 """
@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import json_numpy
@@ -38,7 +39,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from huggingface_hub import snapshot_download
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoTokenizer
+
+# Support running this script directly from any working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from experiments.olmo.hf_model.configuration_molmoact2 import MolmoAct2Config
+from experiments.olmo.hf_model.image_processing_molmoact2 import MolmoAct2ImageProcessor
+from experiments.olmo.hf_model.modeling_molmoact2 import MolmoAct2ForConditionalGeneration
+from experiments.olmo.hf_model.processing_molmoact2 import MolmoAct2Processor
+from experiments.olmo.hf_model.video_processing_molmoact2 import MolmoAct2VideoProcessor
 
 # Patches the stdlib `json` module so np.ndarray round-trips through JSON.
 # Must be called before any json.dumps/loads we rely on.
@@ -54,65 +65,39 @@ log = logging.getLogger("molmoact2.server")
 REPO_ID = "allenai/MolmoAct2-DROID"
 NORM_TAG = "franka_droid"
 DEFAULT_NUM_STEPS = 10
+DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoint"
 
 
-def _patch_modeling_for_bf16(local_dir: str) -> None:
-    """Patch the upstream `modeling_molmoact2.py` so the flow-matching
-    trajectory inherits the model's dtype instead of being hardcoded to
-    float32. Without this, loading in bfloat16 fails with
-    `mat1 and mat2 must have the same dtype` once the action expert runs.
-
-    The patch is idempotent and edits both the snapshot copy and the
-    transformers `~/.cache/huggingface/modules/...` copy that
-    `trust_remote_code` actually imports from.
-    """
-    patches = [
-        # 1. Make the flow-matching trajectory inherit the model dtype so it
-        #    matches the action-expert weights (bf16 vs hardcoded fp32).
-        (
-            "device=device,\n            dtype=torch.float32,\n            generator=generator,",
-            "device=device,\n"
-            "            dtype=source_tensor.dtype,  # patched_bf16_dtype\n"
-            "            generator=generator,",
-            "patched_bf16_dtype",
-        ),
-        # 2. `_to_array` calls `.numpy()` on the action tensor for
-        #    unnormalisation; bf16 has no numpy dtype, so cast to fp32 first.
-        (
-            "return value.detach().cpu().numpy().astype(np.float32, copy=False)",
-            "return value.detach().cpu().float().numpy().astype(np.float32, copy=False)  # patched_bf16_to_array",
-            "patched_bf16_to_array",
-        ),
-    ]
-    candidates = [os.path.join(local_dir, "modeling_molmoact2.py")]
-    modules_root = os.path.expanduser(
-        "~/.cache/huggingface/modules/transformers_modules"
+def _resolve_checkpoint(checkpoint_dir: str | Path, repo_id: str) -> str:
+    """Accept an exported checkpoint or the repository's local HF cache."""
+    path = Path(checkpoint_dir).expanduser().resolve()
+    if (path / "config.json").is_file():
+        return str(path)
+    # The default checkpoint directory contains hub/models--.../snapshots/...
+    # Resolve the cached revision without downloading or importing cached code.
+    return snapshot_download(
+        repo_id=repo_id, cache_dir=str(path / "hub"), local_files_only=True
     )
-    if os.path.isdir(modules_root):
-        for sub in os.listdir(modules_root):
-            p = os.path.join(modules_root, sub, "modeling_molmoact2.py")
-            if os.path.isfile(p):
-                candidates.append(p)
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                src = f.read()
-        except OSError:
-            continue
-        new_src = src
-        applied: list[str] = []
-        for needle, replacement, marker in patches:
-            if marker in new_src:
-                continue
-            if needle not in new_src:
-                log.warning("patch %s: needle not found in %s", marker, path)
-                continue
-            new_src = new_src.replace(needle, replacement, 1)
-            applied.append(marker)
-        if new_src != src:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(new_src)
-            log.info("Applied patches %s in %s", applied, path)
+
+
+def _load_processor(local_dir: str) -> MolmoAct2Processor:
+    """Load checkpoint settings with the repository's processor classes."""
+    config, _ = MolmoAct2Processor.get_processor_dict(
+        local_dir, local_files_only=True
+    )
+    image_processor = MolmoAct2ImageProcessor.from_pretrained(
+        local_dir, local_files_only=True
+    )
+    video_processor = MolmoAct2VideoProcessor.from_pretrained(
+        local_dir, local_files_only=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        local_dir, local_files_only=True, trust_remote_code=False,
+        extra_special_tokens={},
+    )
+    return MolmoAct2Processor.from_args_and_dict(
+        [image_processor, video_processor, tokenizer], config
+    )
 
 
 class Policy:
@@ -124,17 +109,13 @@ class Policy:
         device: str,
         dtype: torch.dtype,
         enable_cuda_graph: bool = False,
+        checkpoint_dir: str | Path = DEFAULT_CHECKPOINT_DIR,
     ) -> None:
         self.default_cuda_graph = enable_cuda_graph
-        # The MolmoAct2 model code reads `norm_stats.json` from
-        # `config._name_or_path`. Loading by repo id makes that a non-path
-        # string, so `predict_action` fails at runtime. Resolve the local
-        # snapshot dir up front and load from there — `snapshot_download` is a
-        # no-op when files are cached.
-        local_dir = snapshot_download(repo_id=repo_id)
-        log.info("Resolved snapshot dir: %s", local_dir)
-
-        _patch_modeling_for_bf16(local_dir)
+        # Normalization stats are read relative to config._name_or_path.
+        local_dir = _resolve_checkpoint(checkpoint_dir, repo_id)
+        self.checkpoint_dir = local_dir
+        log.info("Loading local checkpoint: %s", local_dir)
 
         log.info("Loading processor")
         # The tokenizer_config.json ships `extra_special_tokens` as a list, but
@@ -142,15 +123,16 @@ class Policy:
         # `'list' object has no attribute 'keys'`. The model code only looks
         # these up via `convert_tokens_to_ids`, so overriding with an empty
         # dict is safe and avoids monkey-patching transformers.
-        self.processor = AutoProcessor.from_pretrained(
-            local_dir, trust_remote_code=True, extra_special_tokens={}
-        )
+        self.processor = _load_processor(local_dir)
 
         log.info("Loading model (dtype=%s, device=%s)", dtype, device)
+        config = MolmoAct2Config.from_pretrained(local_dir, local_files_only=True)
+        config._name_or_path = local_dir
         self.model = (
-            AutoModelForImageTextToText.from_pretrained(
+            MolmoAct2ForConditionalGeneration.from_pretrained(
                 local_dir,
-                trust_remote_code=True,
+                config=config,
+                local_files_only=True,
                 torch_dtype=dtype,
             )
             .to(device)
@@ -195,11 +177,15 @@ class Policy:
         ext_pil = _to_pil(external_cam)
         wri_pil = _to_pil(wrist_cam)
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
-        # print(f"MolmoAct2 input state={state_f32}")
         if state_f32.shape != (8,):
             raise ValueError(f"state must be shape (8,), got {state_f32.shape}")
 
         with self._lock:
+            ACTION_SAMPLE_SEEDS = (42, 123, 456, 789, 1024, 2024, 3407, 5678, 8765, 9999)
+            manual_seeds = [
+                    torch.Generator(device=self.device).manual_seed(seed)
+                    for seed in ACTION_SAMPLE_SEEDS
+                ]
             out = self.model.predict_action(
                 processor=self.processor,
                 images=[ext_pil, wri_pil],
@@ -209,6 +195,8 @@ class Policy:
                 inference_action_mode="continuous",
                 enable_depth_reasoning=False,
                 num_steps=num_steps,
+                num_samples=len(ACTION_SAMPLE_SEEDS),
+                generator=manual_seeds,
                 normalize_language=True,
                 enable_cuda_graph=enable_cuda_graph,
             )
@@ -218,7 +206,6 @@ class Policy:
         actions = np.asarray(raw, dtype=np.float32)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
-        # print(f"MolmoAct2 predicted actions={actions}")
         return actions
 
 
@@ -242,6 +229,7 @@ def build_app(policy: Policy) -> FastAPI:
             {
                 "status": "ok",
                 "repo_id": REPO_ID,
+                "checkpoint_dir": policy.checkpoint_dir,
                 "norm_tag": NORM_TAG,
                 "device": policy.device,
                 "dtype": str(policy.model.dtype),
@@ -325,7 +313,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MolmoAct2-DROID inference server")
     p.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
-    p.add_argument("--repo-id", default=REPO_ID, help=f"HF repo id (default: {REPO_ID})")
+    p.add_argument("--repo-id", default=REPO_ID, help=f"repo id within the local checkpoint cache (default: {REPO_ID})")
+    p.add_argument(
+        "--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR,
+        help="local checkpoint directory or directory containing hub/ (default: %(default)s)",
+    )
     p.add_argument("--device", default="cuda:0", help="torch device (default: cuda:0)")
     p.add_argument(
         "--dtype",
@@ -350,11 +342,9 @@ def main() -> None:
         "float32": torch.float32,
     }[args.dtype]
 
-    # hf-transfer accelerates downloads but is harmless when files are cached.
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-
     policy = Policy(
         repo_id=args.repo_id,
+        checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         dtype=dtype,
         enable_cuda_graph=args.cuda_graph,
